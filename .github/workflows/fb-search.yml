@@ -1,0 +1,132 @@
+name: FB Search
+
+# Runs in the PUBLIC naami-fb-ci repo (free Actions minutes). Naami code is private: it is checked out below with CI_GH_TOKEN.
+# Secrets needed on THIS repo:
+#   CI_GH_TOKEN            PAT with read+write on naami24x7/Naami (checkout + pushing results back)
+#   FB_SESSION_JSON        Facebook login cookies (c_user + xs at minimum) as JSON - used for SEARCH
+#   FB_REPLY_SESSION_JSON  optional: a different login used only for posting comments (e.g. Page admin acting as the Page)
+# Results (.github/fb-results/<job_id>.json) stay in the private Naami repo, where Render reads them.
+# PUBLIC-REPO PRIVACY: Actions logs here are visible to everyone, so the worker's stdout (the result JSON with buyer posts)
+# and stderr (its log) are NOT printed - they go to files and are pushed to the private Naami repo instead.
+
+on:
+  repository_dispatch:
+    types: [fb_search, fb_reply]
+
+permissions:
+  contents: read
+
+jobs:
+  fb-worker:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    concurrency:
+      group: fb-worker          # one browser session at a time on this account
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: naami24x7/Naami
+          token: ${{ secrets.CI_GH_TOKEN }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install deps
+        run: |
+          pip install beautifulsoup4 playwright
+          playwright install --with-deps chromium
+
+      - name: Write FB session file
+        env:
+          FB_SESSION_JSON: ${{ secrets.FB_SESSION_JSON }}
+        run: |
+          if [ -z "$FB_SESSION_JSON" ]; then
+            echo "❌ FB_SESSION_JSON secret is not set on this repo — add it in Settings > Secrets and variables > Actions"
+            exit 1
+          fi
+          printf '%s' "$FB_SESSION_JSON" > fb_session.json
+
+      - name: Write FB reply session file (optional)
+        env:
+          FB_REPLY_SESSION_JSON: ${{ secrets.FB_REPLY_SESSION_JSON }}
+        run: |
+          if [ -n "$FB_REPLY_SESSION_JSON" ]; then printf '%s' "$FB_REPLY_SESSION_JSON" > fb_reply_session.json; fi
+
+      - name: Write payload
+        env:
+          FB_PAYLOAD: ${{ toJson(github.event.client_payload) }}
+        run: echo "$FB_PAYLOAD" > payload.json
+
+      - name: Run FB worker (search or reply)
+        # stdout (result JSON) + stderr (log) go to files, NOT the public log
+        run: python fb_search_worker.py payload.json > result.json 2> worker.log || echo "worker exited non-zero (see private log)"
+
+      - name: Push result + log to the private Naami repo (so Render can read it back)
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.CI_GH_TOKEN }}
+          JOB_ID: ${{ github.event.client_payload.job_id }}
+        run: |
+          python3 - <<'PYEOF'
+          import base64, json, os, urllib.request
+
+          token = os.environ["GH_TOKEN"]
+          job_id = os.environ.get("JOB_ID") or "unknown"
+          repo = "naami24x7/Naami"
+          hdr = {"Authorization": f"token {token}", "Accept": "application/vnd.github+json"}
+
+          def put(remote_path, content, msg):
+              api = f"https://api.github.com/repos/{repo}/contents/{remote_path}"
+              sha = None
+              try:
+                  with urllib.request.urlopen(urllib.request.Request(api, headers=hdr)) as resp:
+                      sha = json.loads(resp.read())["sha"]
+              except Exception:
+                  pass
+              body = {"message": msg, "content": base64.b64encode(content).decode()}
+              if sha:
+                  body["sha"] = sha
+              req = urllib.request.Request(api, data=json.dumps(body).encode(),
+                                           headers={**hdr, "Content-Type": "application/json"}, method="PUT")
+              with urllib.request.urlopen(req) as resp:
+                  print("pushed", remote_path, resp.status)
+
+          try:
+              content = open("result.json", "rb").read().decode("utf-8").strip().splitlines()[-1]
+              json.loads(content)                       # last line must be the result JSON
+              content = content.encode()
+          except Exception:
+              content = b'{"success": false, "error": "worker produced no output (likely crashed, was killed, or FB_SESSION_JSON missing)"}'
+          put(f".github/fb-results/{job_id}.json", content, f"ci: fb-search result for {job_id} (auto)")
+
+          try:   # worker log -> private repo only (tail), handy when a job fails
+              log = open("worker.log", "rb").read()[-60000:]
+              if log.strip():
+                  put(f".github/fb-results/logs/{job_id}.log", log, f"ci: fb-search log for {job_id} (auto)")
+          except Exception as e:
+              print("log push skipped:", type(e).__name__)
+          PYEOF
+
+      - name: Push debug screenshots + page HTML (only when payload.debug)
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.CI_GH_TOKEN }}
+          JOB_ID: ${{ github.event.client_payload.job_id }}
+        run: |
+          python3 - <<'PYEOF'
+          import base64, glob, json, os, urllib.request
+          token = os.environ["GH_TOKEN"]; job_id = os.environ.get("JOB_ID") or "unknown"
+          for path in sorted(glob.glob("fb_debug/*.jpg") + glob.glob("fb_debug/*.html")):
+              name = os.path.basename(path)
+              api = f"https://api.github.com/repos/naami24x7/Naami/contents/.github/fb-results/debug/{job_id}_{name}"
+              body = {"message": f"ci: fb-search debug shot {job_id}_{name} (auto)", "content": base64.b64encode(open(path, "rb").read()).decode()}
+              req = urllib.request.Request(api, data=json.dumps(body).encode(), method="PUT",
+                                           headers={"Authorization": f"token {token}", "Accept": "application/vnd.github+json", "Content-Type": "application/json"})
+              try:
+                  with urllib.request.urlopen(req) as resp:
+                      print("pushed", name, resp.status)
+              except Exception as e:
+                  print("debug push failed", name, type(e).__name__)
+          PYEOF
