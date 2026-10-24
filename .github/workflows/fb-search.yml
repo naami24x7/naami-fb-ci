@@ -21,7 +21,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 35
     concurrency:
-      group: fb-worker          # one browser session at a time on this account
+      group: fb-worker-${{ github.event.action }}   # scans and replies get separate queues: a reply never waits behind (or gets dropped by) a 13-min scan
       cancel-in-progress: false
     steps:
       - uses: actions/checkout@v4
